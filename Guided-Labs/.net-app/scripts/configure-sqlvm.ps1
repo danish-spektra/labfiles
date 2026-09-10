@@ -1,5 +1,8 @@
 param (
-    [Parameter(Mandatory=$False)] [string] $SqlPass = ""
+    [Parameter(Mandatory=$False)] [string] $SqlPass = "",
+    # The VM administrator from the ARM template. Used only as a fallback SQL identity when
+    # NT AUTHORITY\SYSTEM turns out not to be a sysadmin on this instance.
+    [Parameter(Mandatory=$False)] [string] $VmAdminUser = "demouser"
 )
 
 # This script had no transcript, so when the PartsUnlimited database failed to appear
@@ -111,6 +114,63 @@ function Wait-SqlOnline {
     return $false
 }
 
+# True only when both the database and the login the web app needs actually exist.
+function Test-SqlObjects {
+    param([hashtable] $SqlArgs, [string] $DatabaseName)
+    $db    = Invoke-Sqlcmd "SELECT name FROM sys.databases WHERE name = '$DatabaseName'" @SqlArgs -ErrorAction SilentlyContinue
+    $login = Invoke-Sqlcmd "SELECT name FROM sys.sql_logins WHERE name = 'PUWebSite'" @SqlArgs -ErrorAction SilentlyContinue
+    return ([bool]$db -and [bool]$login)
+}
+
+# Run the same T-SQL as the VM administrator instead of NT AUTHORITY\SYSTEM.
+#
+# The extension runs as SYSTEM and cannot change its own SQL login. On Azure SQL Server
+# images the VM's local administrator is a sysadmin even where SYSTEM is not, so the only
+# way to use it is to launch a process as that user. Start-Process -Credential is
+# unreliable from SYSTEM (it wants SeAssignPrimaryToken and a loaded profile), so use a
+# scheduled task, which is built for exactly this.
+function Invoke-SqlAsVmAdmin {
+    param(
+        [string[]]  $Statements,
+        [string]    $UserName,
+        [string]    $Password,
+        [hashtable] $SqlArgs
+    )
+
+    $taskName   = 'CloudLabsSqlSetup'
+    $scriptPath = 'C:\Windows\Temp\cloudlabs-sql-setup.ps1'
+    $trust = if ($SqlArgs.ContainsKey('TrustServerCertificate')) { ' -TrustServerCertificate' } else { '' }
+
+    $lines = @('$ErrorActionPreference = ''Stop''')
+    foreach ($statement in $Statements) {
+        # Emitted inside single quotes, so double any single quotes in the T-SQL.
+        $escaped = $statement.Replace("'", "''")
+        $lines += "Invoke-Sqlcmd '$escaped' -ServerInstance '$($SqlArgs.ServerInstance)' -QueryTimeout 3600$trust"
+    }
+    Set-Content -Path $scriptPath -Value $lines -Encoding UTF8
+
+    try {
+        Write-Host "Running SQL setup as $UserName via a scheduled task"
+        $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File `"$scriptPath`""
+        Register-ScheduledTask -TaskName $taskName -Action $action -User ".\$UserName" -Password $Password -RunLevel Highest -Force | Out-Null
+        Start-ScheduledTask -TaskName $taskName
+
+        $deadline = (Get-Date).AddMinutes(5)
+        do {
+            Start-Sleep -Seconds 5
+            $state = (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue).State
+        } while ($state -eq 'Running' -and (Get-Date) -lt $deadline)
+        Write-Host "Scheduled task finished in state '$state'"
+    }
+    catch {
+        Write-Warning "Could not run SQL setup as ${UserName}: $($_.Exception.Message)"
+    }
+    finally {
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+        Remove-Item $scriptPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
 # Create the PartsUnlimited database and the PUWebSite login the web app connects with.
 function Setup-Sql {
     #Add snap-in
@@ -142,26 +202,57 @@ function Setup-Sql {
     # actually accept a query before touching it.
     if (-not (Wait-SqlOnline -SqlArgs $sqlArgs)) { return }
 
-    # Every statement is guarded with IF ... IS NULL, so the whole block is safe to retry.
-    # That also makes it re-runnable by hand on a VM where it partly succeeded.
-    $configured = $false
-    for ($attempt = 1; $attempt -le 3 -and -not $configured; $attempt++) {
-        try {
-            Write-Host "Configuring $DatabaseName (attempt $attempt)"
-            Invoke-Sqlcmd "IF DB_ID('$DatabaseName') IS NULL CREATE DATABASE [$DatabaseName]" @sqlArgs -ErrorAction Stop
-            Invoke-Sqlcmd "ALTER DATABASE [$DatabaseName] SET DISABLE_BROKER;" @sqlArgs -ErrorAction Stop
-            Invoke-Sqlcmd "IF SUSER_ID('PUWebSite') IS NULL CREATE LOGIN PUWebSite WITH PASSWORD = '$SqlPass';" @sqlArgs -ErrorAction Stop
-            Invoke-Sqlcmd "USE [$DatabaseName];IF USER_ID('PUWebSite') IS NULL CREATE USER PUWebSite FOR LOGIN [PUWebSite];EXEC sp_addrolemember 'db_owner', 'PUWebSite'; " @sqlArgs -ErrorAction Stop
-            Invoke-Sqlcmd "EXEC sp_addsrvrolemember @loginame = N'PUWebSite', @rolename = N'sysadmin';" @sqlArgs -ErrorAction Stop
-            # Mixed-mode auth. Without this, SQL logins are rejected with exactly
-            # "Login failed for user" even when they exist. Needs the service restart below.
-            Invoke-Sqlcmd "EXEC xp_instance_regwrite N'HKEY_LOCAL_MACHINE', N'Software\Microsoft\MSSQLServer\MSSQLServer', N'LoginMode', REG_DWORD, 2" @sqlArgs -ErrorAction Stop
-            $configured = $true
+    # Who are we, and may we actually create a database?
+    # A working connection proves nothing: SELECT 1 needs no privilege, while CREATE
+    # DATABASE needs sysadmin or dbcreator. This extension runs as NT AUTHORITY\SYSTEM,
+    # which is not a sysadmin on every SQL Server image - and that is the difference
+    # between "SQL is not ready yet" and "SQL will not let us", which look identical from
+    # the outside and is why this took several deployments to pin down.
+    $canCreate = $false
+    try {
+        $who = Invoke-Sqlcmd "SELECT SUSER_NAME() AS [login], IS_SRVROLEMEMBER('sysadmin') AS [sysadmin], IS_SRVROLEMEMBER('dbcreator') AS [dbcreator]" @sqlArgs -ErrorAction Stop
+        Write-Host "Connected to SQL as '$($who.login)' - sysadmin=$($who.sysadmin) dbcreator=$($who.dbcreator)"
+        $canCreate = ($who.sysadmin -eq 1 -or $who.dbcreator -eq 1)
+    }
+    catch {
+        Write-Warning "Could not read SQL identity: $($_.Exception.Message)"
+    }
+
+    # One copy of the statements, so the direct path and the fallback run the same thing.
+    # Each is guarded with IF ... IS NULL, so the whole set is safe to repeat.
+    $statements = @(
+        "IF DB_ID('$DatabaseName') IS NULL CREATE DATABASE [$DatabaseName]"
+        "ALTER DATABASE [$DatabaseName] SET DISABLE_BROKER;"
+        "IF SUSER_ID('PUWebSite') IS NULL CREATE LOGIN PUWebSite WITH PASSWORD = '$SqlPass';"
+        "USE [$DatabaseName];IF USER_ID('PUWebSite') IS NULL CREATE USER PUWebSite FOR LOGIN [PUWebSite];EXEC sp_addrolemember 'db_owner', 'PUWebSite';"
+        "EXEC sp_addsrvrolemember @loginame = N'PUWebSite', @rolename = N'sysadmin';"
+        # Mixed-mode auth. Without this, SQL logins are rejected with exactly
+        # "Login failed for user" even when they exist. Needs the service restart below.
+        "EXEC xp_instance_regwrite N'HKEY_LOCAL_MACHINE', N'Software\Microsoft\MSSQLServer\MSSQLServer', N'LoginMode', REG_DWORD, 2"
+    )
+
+    if ($canCreate) {
+        for ($attempt = 1; $attempt -le 3; $attempt++) {
+            try {
+                Write-Host "Configuring $DatabaseName (attempt $attempt)"
+                foreach ($statement in $statements) { Invoke-Sqlcmd $statement @sqlArgs -ErrorAction Stop }
+                break
+            }
+            catch {
+                Write-Warning "Attempt $attempt failed: $($_.Exception.Message)"
+                Start-Sleep -Seconds 15
+            }
         }
-        catch {
-            Write-Warning "Attempt $attempt failed: $($_.Exception.Message)"
-            Start-Sleep -Seconds 15
-        }
+    }
+    else {
+        Write-Warning "NT AUTHORITY\SYSTEM cannot create databases on this instance."
+    }
+
+    # This fallback is why the lab no longer needs a human with SSMS: if the objects still
+    # are not there, run the identical statements as the VM administrator, which is a
+    # sysadmin on these images even when SYSTEM is not.
+    if (-not (Test-SqlObjects -SqlArgs $sqlArgs -DatabaseName $DatabaseName)) {
+        Invoke-SqlAsVmAdmin -Statements $statements -UserName $VmAdminUser -Password $SqlPass -SqlArgs $sqlArgs
     }
 
     Restart-Service -Force MSSQLSERVER
