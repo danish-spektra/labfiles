@@ -84,20 +84,63 @@ if (Test-Path "$env:windir\System32\inetsrv\config\schema\aspnetcore_schema_v2.x
     Write-Warning "AspNetCoreModuleV2 is NOT registered with IIS - expect HTTP 500.19 (0x8007000d) on the site."
 }
 
-# Copy Web Site Files
-Wait-Install
-Write-Host "Copying default website files..."
-Expand-Archive -LiteralPath "C:\MCW\MCW-App-modernization-$branchName\Hands-on lab\lab-files\PartsUnlimitedWebsite.zip" -DestinationPath 'C:\inetpub\wwwroot' -Force
+# Deploy the site files, with IIS stopped.
+#
+# IIS must be stopped first. Now that the ASP.NET Core module is installed, w3wp actually
+# loads the app and holds its DLLs open, and Expand-Archive -Force deletes each existing
+# file before rewriting it. Against a running app pool that fails with:
+#   Remove-Item : Cannot remove item C:\inetpub\wwwroot\Microsoft.EntityFrameworkCore.*.dll
+#   Access to the path '...' is denied.  (UnauthorizedAccessException)
+# This never showed up before because the app could not start at all, so nothing was locked.
+function Deploy-Website {
+    $siteZip = "C:\MCW\MCW-App-modernization-$branchName\Hands-on lab\lab-files\PartsUnlimitedWebsite.zip"
+    $configJson = "C:\MCW\MCW-App-modernization-$branchName\Hands-on lab\lab-files\src\src\PartsUnlimitedWebsite\config.json"
+    $webRoot = 'C:\inetpub\wwwroot'
 
-# Copy the database connection string to the web app.
-Write-Host "Updating config.json with the SQL IP Address and connection string information."
-Copy-Item "C:\MCW\MCW-App-modernization-$branchName\Hands-on lab\lab-files\src\src\PartsUnlimitedWebsite\config.json" -Destination 'C:\inetpub\wwwroot' -Force
+    Wait-Install
+    Write-Host "Stopping IIS so the site files are not locked"
+    iisreset.exe /stop
+
+    try {
+        Write-Host "Copying default website files..."
+        Expand-Archive -LiteralPath $siteZip -DestinationPath $webRoot -Force
+
+        Write-Host "Updating config.json with the SQL IP Address and connection string information."
+        Copy-Item $configJson -Destination $webRoot -Force
+
+        # The shipped web.config sends stdout to '\\?\%home%\LogFiles\stdout', which is an
+        # App Service path - %home% does not exist on IIS, so the module logs
+        # "Could not start stdout file redirection ... The system cannot find the path
+        # specified" and the app's own exceptions go nowhere. Repoint it at a real folder so
+        # a request-time 500 (a bad connection string, an unreachable database) is
+        # diagnosable from the VM instead of needing another deployment.
+        $webConfig = Join-Path $webRoot 'web.config'
+        $stdoutDir = 'C:\inetpub\logs\stdout'
+        New-Item -ItemType Directory -Path $stdoutDir -Force | Out-Null
+        if (Test-Path $webConfig) {
+            (Get-Content $webConfig -Raw).Replace('\\?\%home%\LogFiles\stdout', "$stdoutDir\stdout") |
+                Set-Content -Path $webConfig -Encoding UTF8
+            Write-Host "  app stdout log -> $stdoutDir\stdout*.log"
+        }
+    }
+    finally {
+        Write-Host "Starting IIS"
+        iisreset.exe /start
+    }
+
+    # The app cannot start without these two, so fail loudly rather than at the HTTP check.
+    foreach ($required in 'PartsUnlimitedWebsite.dll', 'web.config', 'config.json') {
+        if (Test-Path (Join-Path $webRoot $required)) {
+            Write-Host "  $required deployed"
+        } else {
+            Write-Error "  $required is MISSING from $webRoot"
+        }
+    }
+}
+
+Deploy-Website
 
 Unregister-ScheduledTask -TaskName "Install Lab Requirements" -Confirm:$false
-
-# Restart the app for the startup to pick up the database connection string.
-Write-Host "Restarting IIS"
-iisreset.exe /restart
 
 CD C:\LabFiles
 $credsfilepath = ".\AzureCreds.txt"
@@ -165,24 +208,36 @@ if ($HTTP_Status -eq 200) {
      Write-Host "Post Deployment is successful"
     }
 else{
-    # Re-deploying the site files is the only thing worth retrying here. Reinstalling the
-    # SDK on every attempt (as this used to) cost minutes and never fixed anything - if
-    # the site is down because the hosting bundle is missing, no amount of retrying helps.
-    $branchName = "microsoft-app-modernization-v2"
-
-    # Copy Web Site Files
-    Wait-Install
-    Write-Host "Copying default website files..."
-    Expand-Archive -LiteralPath "C:\MCW\MCW-App-modernization-$branchName\Hands-on lab\lab-files\PartsUnlimitedWebsite.zip" -DestinationPath 'C:\inetpub\wwwroot' -Force
-
-    # Copy the database connection string to the web app.
-    Write-Host "Updating config.json with the SQL IP Address and connection string information."
-    Copy-Item "C:\MCW\MCW-App-modernization-$branchName\Hands-on lab\lab-files\src\src\PartsUnlimitedWebsite\config.json" -Destination 'C:\inetpub\wwwroot' -Force
-
-    # Restart the app for the startup to pick up the database connection string.
-    Write-Host "Restarting IIS"
+    # Do NOT re-expand the site files here. Deploy-Website already placed them with IIS
+    # stopped, and re-expanding over a running app pool is what produced
+    # "Access to the path ... is denied" on the EntityFrameworkCore DLLs. Re-extracting the
+    # same zip up to seven times has never fixed a 500 anyway - the causes seen so far were
+    # a missing ASP.NET Core module and a missing database, neither fixed by copying files.
+    # Restart the app and report why it is failing instead.
+    Write-Host "Restarting IIS and re-checking"
     iisreset.exe /restart
-} 
+
+    # Whatever is making the app return 500 is recorded by the ASP.NET Core module, so
+    # surface it in this transcript rather than needing another deployment to find it.
+    $ancmEvents = Get-WinEvent -LogName Application -MaxEvents 200 -ErrorAction SilentlyContinue |
+        Where-Object { $_.ProviderName -like '*AspNetCore*' -or $_.ProviderName -eq 'IIS AspNetCore Module V2' } |
+        Select-Object -First 3
+    if ($ancmEvents) {
+        Write-Host "--- most recent ASP.NET Core module events ---"
+        $ancmEvents | ForEach-Object { Write-Host "[$($_.TimeCreated)] $($_.Message)" }
+        Write-Host "--- end ---"
+    }
+
+    # If the module reports the app started but requests still 500, the exception is the
+    # app's own - and it is almost always the database. This is where it says so.
+    $stdoutLog = Get-ChildItem 'C:\inetpub\logs\stdout\stdout*.log' -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if ($stdoutLog) {
+        Write-Host "--- tail of $($stdoutLog.Name) ---"
+        Get-Content $stdoutLog.FullName -Tail 25
+        Write-Host "--- end ---"
+    }
+}
 }
 
 sleep 120
