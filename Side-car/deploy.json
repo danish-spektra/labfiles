@@ -40,7 +40,7 @@
     }
   },
   "variables": {
-    "scripturl": "https://experienceazure.blob.core.windows.net/templates/guided-labs/custom-rag-ms-foundry/scripts/psscript-01.ps1",
+    "scripturl": "https://raw.githubusercontent.com/danish-spektra/labfiles/main/Side-car/psscript.ps1",
     "userdata": "[concat('$url = \"', variables('scripturl'),'\"; $arg = \"', variables('arg'), '\"')]",
     "arg": "[concat(variables('arg1'),variables('arg2'),variables('arg3'),variables('arg4'),variables('arg5'),variables('arg6'))]",
     "arg1": "[concat(' -AzureUserName ', parameters('AzureUserName'), ' -AzurePassword ', parameters('AzurePassword'))]",
