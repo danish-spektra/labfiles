@@ -22,9 +22,15 @@ param (
   
     [string]
     $AzureSubscriptionID,
-  
+
     [string]
-    $adminPassword
+    $adminPassword,
+
+    # Where the other lab scripts are published. Passed in by the ARM template so the
+    # repo, branch and folder live in one place; the default keeps the script runnable
+    # by hand. Change it in arm.json, not here.
+    [string]
+    $ScriptsBaseUri = "https://raw.githubusercontent.com/danish-spektra/labfiles/main/Guided-Labs/.net-app/scripts/"
 )
 
 Start-Transcript -Path C:\WindowsAzure\Logs\CloudLabsCustomScriptExtension.txt -Append
@@ -37,18 +43,20 @@ Install-WindowsFeature -name Web-Server -IncludeManagementTools
 
 $branchName = "microsoft-app-modernization-v2"
 
-# Lab deployment scripts are published alongside the ARM template in the CloudLabs
-# templates container, not in the GitHub repo. Download the ones that run after this
-# script to a stable path - the CustomScriptExtension Downloads folder is not durable.
-$scriptsBaseUri = "https://experienceazure.blob.core.windows.net/templates/app-modernization-V2/scripts"
+# The lab deployment scripts live next to this one in the labfiles repo. Download the ones
+# that run after this script to a stable path - the CustomScriptExtension Downloads folder
+# is documented as not durable over the life of the VM, and these run after a reboot.
+# Tolerate a trailing slash on the parameter (assigns back to the same variable -
+# PowerShell variable names are case-insensitive).
+$ScriptsBaseUri = $ScriptsBaseUri.TrimEnd('/')
 $labScriptsPath = "C:\LabFiles\scripts"
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 New-Item -ItemType Directory -Path $labScriptsPath -Force | Out-Null
 
 foreach ($scriptName in @("webvm-logon-install.ps1", "sqlvm-logontask.ps1")) {
-    Write-Host "Downloading $scriptName from the templates container" -ForegroundColor Green
-    Invoke-WebRequest -Uri "$scriptsBaseUri/$scriptName" -OutFile "$labScriptsPath\$scriptName" -UseBasicParsing
+    Write-Host "Downloading $scriptName from $ScriptsBaseUri" -ForegroundColor Green
+    Invoke-WebRequest -Uri "$ScriptsBaseUri/$scriptName" -OutFile "$labScriptsPath\$scriptName" -UseBasicParsing
 }
 
 # Download and extract the lab source code - the Parts Unlimited solution that exercises

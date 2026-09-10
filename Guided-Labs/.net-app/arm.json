@@ -79,19 +79,14 @@
     "subnetName1": "subnet2",
     "subnetPrefix1": "176.16.1.0/24",
 
-    "templatesBaseUri": "https://experienceazure.blob.core.windows.net/templates/",
-    "cloudlabsCommonScriptUri": "[concat(variables('templatesBaseUri'), 'cloudlabs-common/cloudlabs-windows-functions.ps1')]",
+    "cloudlabsCommonScriptUri": "https://experienceazure.blob.core.windows.net/templates/cloudlabs-common/cloudlabs-windows-functions.ps1",
 
-    "scriptsFolderPath": "app-modernization-V2/scripts",
-    "scriptsBaseUri": "[concat(variables('templatesBaseUri'), variables('scriptsFolderPath'), '/')]",
-    "scriptsLocalPath": "[concat('.\\', replace(variables('scriptsFolderPath'), '/', '\\'))]",
+    "scriptsBaseUri": "https://raw.githubusercontent.com/danish-spektra/labfiles/main/Guided-Labs/.net-app/scripts/",
 
     "webCustomScriptFileName": "configure-webvm.ps1",
     "webCustomScriptUri": "[concat(variables('scriptsBaseUri'), variables('webCustomScriptFileName'))]",
-    "webCustomScriptLocalPath": "[concat(variables('scriptsLocalPath'), '\\', variables('webCustomScriptFileName'))]",
     "sqlCustomScriptFileName": "configure-sqlvm.ps1",
     "sqlCustomScriptUri": "[concat(variables('scriptsBaseUri'), variables('sqlCustomScriptFileName'))]",
-    "sqlCustomScriptLocalPath": "[concat(variables('scriptsLocalPath'), '\\', variables('sqlCustomScriptFileName'))]",
     "dmsName": "[concat('parts-dms-', parameters('DeploymentID'))]",
     "hostingPlanName": "[concat(resourceGroup().name, '-asp-ln-fn')]",
     "functionAppName": "[concat('parts-func-', parameters('DeploymentID'))]",
@@ -190,7 +185,7 @@
                 "[variables('webCustomScriptUri')]",
                 "[variables('cloudlabsCommonScriptUri')]"
               ],
-              "commandToExecute": "[concat('powershell -ExecutionPolicy Unrestricted -File ', variables('webCustomScriptLocalPath'), ' ', reference(resourceId('Microsoft.Network/publicIPAddresses',variables('sqlPublicIpAddressName'))).IpAddress, ' ', variables('cloudlabsCommon'))]"
+              "commandToExecute": "[concat('powershell -ExecutionPolicy Unrestricted -File ', variables('webCustomScriptFileName'), ' ', reference(resourceId('Microsoft.Network/publicIPAddresses',variables('sqlPublicIpAddressName'))).IpAddress, ' -ScriptsBaseUri ', variables('scriptsBaseUri'), ' ', variables('cloudlabsCommon'))]"
 
             }
           },
@@ -262,7 +257,7 @@
               "fileUris": [
                 "[variables('sqlCustomScriptUri')]"
               ],
-              "commandToExecute": "[concat('powershell -ExecutionPolicy Unrestricted -File ', variables('sqlCustomScriptLocalPath'), ' ', parameters('adminPassword'))]"
+              "commandToExecute": "[concat('powershell -ExecutionPolicy Unrestricted -File ', variables('sqlCustomScriptFileName'), ' ', parameters('adminPassword'))]"
             }
           },
           "dependsOn": [
