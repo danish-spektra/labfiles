@@ -141,26 +141,59 @@ function Invoke-SqlAsVmAdmin {
     $scriptPath = 'C:\Windows\Temp\cloudlabs-sql-setup.ps1'
     $trust = if ($SqlArgs.ContainsKey('TrustServerCertificate')) { ' -TrustServerCertificate' } else { '' }
 
-    $lines = @('$ErrorActionPreference = ''Stop''')
+    # Its own transcript, because this runs in a separate process whose output the
+    # extension never sees.
+    $lines = @(
+        'Start-Transcript -Path C:\WindowsAzure\Logs\cloudlabs-sql-fallback.txt -Append',
+        '$ErrorActionPreference = ''Stop''',
+        'try {'
+    )
     foreach ($statement in $Statements) {
         # Emitted inside single quotes, so double any single quotes in the T-SQL.
         $escaped = $statement.Replace("'", "''")
-        $lines += "Invoke-Sqlcmd '$escaped' -ServerInstance '$($SqlArgs.ServerInstance)' -QueryTimeout 3600$trust"
+        $lines += "    Invoke-Sqlcmd '$escaped' -ServerInstance '$($SqlArgs.ServerInstance)' -QueryTimeout 3600$trust"
     }
+    $lines += @(
+        '}',
+        'catch { Write-Host "FALLBACK FAILED: $($_.Exception.Message)" }',
+        'Stop-Transcript'
+    )
     Set-Content -Path $scriptPath -Value $lines -Encoding UTF8
 
     try {
         Write-Host "Running SQL setup as $UserName via a scheduled task"
         $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File `"$scriptPath`""
-        Register-ScheduledTask -TaskName $taskName -Action $action -User ".\$UserName" -Password $Password -RunLevel Highest -Force | Out-Null
+
+        # Task Scheduler resolves UserId to a SID itself and does not accept the ".\user"
+        # shorthand - that fails with "No mapping between account names and security IDs
+        # was done". Try the fully qualified name first, then the bare one.
+        $registered = $false
+        foreach ($account in @("$env:COMPUTERNAME\$UserName", $UserName)) {
+            try {
+                Register-ScheduledTask -TaskName $taskName -Action $action -User $account -Password $Password -RunLevel Highest -Force -ErrorAction Stop | Out-Null
+                Write-Host "Registered scheduled task to run as '$account'"
+                $registered = $true
+                break
+            }
+            catch {
+                Write-Warning "Could not register the task as '${account}': $($_.Exception.Message)"
+            }
+        }
+        if (-not $registered) {
+            Write-Warning "No usable account form for '$UserName' - skipping the fallback."
+            return
+        }
+
         Start-ScheduledTask -TaskName $taskName
 
         $deadline = (Get-Date).AddMinutes(5)
         do {
             Start-Sleep -Seconds 5
-            $state = (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue).State
-        } while ($state -eq 'Running' -and (Get-Date) -lt $deadline)
-        Write-Host "Scheduled task finished in state '$state'"
+            $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        } while ($task -and $task.State -eq 'Running' -and (Get-Date) -lt $deadline)
+
+        $info = Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction SilentlyContinue
+        Write-Host "Scheduled task finished - state '$($task.State)', last result $($info.LastTaskResult)"
     }
     catch {
         Write-Warning "Could not run SQL setup as ${UserName}: $($_.Exception.Message)"
@@ -310,18 +343,20 @@ if (Test-DmaInstalled) {
 
 Stop-Transcript
 
-# Fail the extension rather than hand over a broken lab.
+# Report loudly, but do NOT fail the extension.
 #
-# Previously this script could fail to create the database and still exit 0, so the ARM
-# deployment reported "status":"success" and the learner got an environment where
-# Exercise 1 and localhost were both dead - recoverable only by someone running SQL by
-# hand. A non-zero exit makes CloudLabs see the deployment fail so it can reprovision.
+# An earlier version exited 1 here so CloudLabs would see a failed deployment rather than
+# hand over a broken lab. That is the right instinct, but in practice a failed CloudLabs
+# deployment is torn down and cannot be inspected - so a genuine problem becomes
+# undiagnosable and nobody gets an environment either. The deployment now completes and
+# the evidence is left on the VM:
 #
-# This is the one deliberate behaviour change here: a deployment that used to "succeed"
-# broken will now fail. Delete this block to go back to the old behaviour.
+#   C:\WindowsAzure\Logs\CloudLabsCustomScriptExtension.txt   (this script)
+#   C:\WindowsAzure\Logs\cloudlabs-sql-fallback.txt           (the VM-admin fallback)
+#
+# Re-enable the hard failure once a deployment is confirmed green end to end.
 if (-not $script:SqlSetupOk) {
-    Write-Error "SQL configuration did not complete - failing this extension deliberately."
-    exit 1
+    Write-Warning "SQL configuration did not complete. See CloudLabsCustomScriptExtension.txt and cloudlabs-sql-fallback.txt on this VM."
 }
 
 Restart-Computer
