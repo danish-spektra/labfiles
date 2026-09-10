@@ -2,6 +2,10 @@ param (
     [Parameter(Mandatory=$False)] [string] $SqlPass = ""
 )
 
+# This script had no transcript, so when the PartsUnlimited database failed to appear
+# there was nothing to diagnose it with. Everything below is now captured on the SQL VM.
+Start-Transcript -Path C:\WindowsAzure\Logs\CloudLabsCustomScriptExtension.txt -Append
+
 # Disable Internet Explorer Enhanced Security Configuration
 function Disable-InternetExplorerESC {
     $AdminKey = "HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components\{A509B1A7-37EF-4b3f-8CFC-4F3A74704073}"
@@ -77,29 +81,54 @@ function Add-SqlFirewallRule {
 
 Add-SqlFirewallRule
 
-# Attach the downloaded backup files to the local SQL Server instance
+# Create the PartsUnlimited database and the PUWebSite login the web app connects with.
 function Setup-Sql {
     #Add snap-in
     Add-PSSnapin SqlServerCmdletSnapin* -ErrorAction SilentlyContinue
 
     $ServerName = 'SQLSERVER2008'
     $DatabaseName = 'PartsUnlimited'
-    
-    $Cmd = "USE [master] CREATE DATABASE [$DatabaseName]"
-    Invoke-Sqlcmd $Cmd -QueryTimeout 3600 -ServerInstance $ServerName
 
-    Invoke-Sqlcmd "ALTER DATABASE [$DatabaseName] SET DISABLE_BROKER;" -QueryTimeout 3600 -ServerInstance $ServerName
-    
-    Invoke-Sqlcmd "CREATE LOGIN PUWebSite WITH PASSWORD = '$SqlPass';" -QueryTimeout 3600 -ServerInstance $ServerName
-    Invoke-Sqlcmd "USE [$DatabaseName];CREATE USER PUWebSite FOR LOGIN [PUWebSite];EXEC sp_addrolemember 'db_owner', 'PUWebSite'; " -QueryTimeout 3600 -ServerInstance $ServerName
+    if (-not (Get-Command Invoke-Sqlcmd -ErrorAction SilentlyContinue)) {
+        Write-Error "Invoke-Sqlcmd is not available - the SqlServer/SQLPS module is missing, so $DatabaseName cannot be created."
+        return
+    }
 
-    Invoke-Sqlcmd "EXEC sp_addsrvrolemember @loginame = N'PUWebSite', @rolename = N'sysadmin';" -QueryTimeout 3600 -ServerInstance $ServerName
+    # SQL Server 2019 presents a self-signed certificate. Recent SqlServer modules use
+    # Microsoft.Data.SqlClient, which defaults to Encrypt=True *with* certificate
+    # validation, so an unqualified Invoke-Sqlcmd fails with "The certificate chain was
+    # issued by an authority that is not trusted" and the database is never created.
+    # Only pass -TrustServerCertificate when the installed module supports it, so this
+    # keeps working on older modules where it is not a valid parameter.
+    $sqlArgs = @{ ServerInstance = $ServerName; QueryTimeout = 3600 }
+    if ((Get-Command Invoke-Sqlcmd).Parameters.ContainsKey('TrustServerCertificate')) {
+        $sqlArgs['TrustServerCertificate'] = $true
+        Write-Host "Using -TrustServerCertificate for Invoke-Sqlcmd"
+    }
 
-    Invoke-Sqlcmd "EXEC xp_instance_regwrite N'HKEY_LOCAL_MACHINE', N'Software\Microsoft\MSSQLServer\MSSQLServer', N'LoginMode', REG_DWORD, 2" -QueryTimeout 3600 -ServerInstance $ServerName
+    Invoke-Sqlcmd "USE [master] CREATE DATABASE [$DatabaseName]" @sqlArgs
+
+    Invoke-Sqlcmd "ALTER DATABASE [$DatabaseName] SET DISABLE_BROKER;" @sqlArgs
+
+    Invoke-Sqlcmd "CREATE LOGIN PUWebSite WITH PASSWORD = '$SqlPass';" @sqlArgs
+    Invoke-Sqlcmd "USE [$DatabaseName];CREATE USER PUWebSite FOR LOGIN [PUWebSite];EXEC sp_addrolemember 'db_owner', 'PUWebSite'; " @sqlArgs
+
+    Invoke-Sqlcmd "EXEC sp_addsrvrolemember @loginame = N'PUWebSite', @rolename = N'sysadmin';" @sqlArgs
+
+    Invoke-Sqlcmd "EXEC xp_instance_regwrite N'HKEY_LOCAL_MACHINE', N'Software\Microsoft\MSSQLServer\MSSQLServer', N'LoginMode', REG_DWORD, 2" @sqlArgs
 
     Restart-Service -Force MSSQLSERVER
     #In case restart failed but service was shut down.
-    Start-Service -Name 'MSSQLSERVER' 
+    Start-Service -Name 'MSSQLSERVER'
+
+    # Exercise 1 has the learner open this database in SSMS, and the web app connects to
+    # it, so say plainly whether it is there rather than failing silently later.
+    $check = Invoke-Sqlcmd "SELECT name FROM sys.databases WHERE name = '$DatabaseName'" @sqlArgs -ErrorAction SilentlyContinue
+    if ($check) {
+        Write-Host "$DatabaseName database created" -ForegroundColor Green
+    } else {
+        Write-Error "$DatabaseName database was NOT created - Exercise 1 and the web app will both fail."
+    }
 }
 
 Setup-Sql
@@ -136,5 +165,6 @@ if (Test-DmaInstalled) {
     Write-Error "Data Migration Assistant did not install - see C:\dma_install.txt"
 }
 
+Stop-Transcript
 
 Restart-Computer

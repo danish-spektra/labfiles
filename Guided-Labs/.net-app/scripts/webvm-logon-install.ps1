@@ -67,15 +67,21 @@ if (Test-Path -Path $edgeInstaller -PathType Leaf) {
     Write-Host "$edgeInstaller not present - Edge is already on the base image, skipping"
 }
 
-# Install .NET Core 3.1 SDK (staged on the image). Exercise 5 builds against 3.1, so warn
-# loudly rather than failing silently if the installer is missing.
-$dotnetInstaller = 'C:\dotnet-sdk-3.1.413-win-x64.exe'
-if (Test-Path -Path $dotnetInstaller -PathType Leaf) {
-    Wait-Install
-    Write-Host "Installing .NET Core 3.1 SDK..."
-    Start-Process -file $dotnetInstaller -arg '/Install /Quiet /Norestart /Logs logCore31SDK.txt' -passthru | wait-process
+# .NET Core 3.1 and the ASP.NET Core hosting bundle are installed by configure-webvm.ps1
+# before the reboot, so there is nothing to install here - just confirm they landed,
+# because a missing hosting bundle is what makes IIS return 500.19 on this site.
+$dotnetExe = "$env:ProgramFiles\dotnet\dotnet.exe"
+if (Test-Path -Path $dotnetExe -PathType Leaf) {
+    Write-Host "Installed .NET runtimes:"
+    & $dotnetExe --list-runtimes
 } else {
-    Write-Warning "$dotnetInstaller not found - the .NET Core 3.1 SDK was not installed"
+    Write-Warning "$dotnetExe not found - the site will not start. Check the hosting bundle install in the configure-webvm.ps1 transcript."
+}
+
+if (Test-Path "$env:windir\System32\inetsrv\config\schema\aspnetcore_schema_v2.xml") {
+    Write-Host "ASP.NET Core module is registered with IIS"
+} else {
+    Write-Warning "AspNetCoreModuleV2 is NOT registered with IIS - expect HTTP 500.19 (0x8007000d) on the site."
 }
 
 # Copy Web Site Files
@@ -159,11 +165,10 @@ if ($HTTP_Status -eq 200) {
      Write-Host "Post Deployment is successful"
     }
 else{
+    # Re-deploying the site files is the only thing worth retrying here. Reinstalling the
+    # SDK on every attempt (as this used to) cost minutes and never fixed anything - if
+    # the site is down because the hosting bundle is missing, no amount of retrying helps.
     $branchName = "microsoft-app-modernization-v2"
-    if (Test-Path -Path $dotnetInstaller -PathType Leaf) {
-        Write-Host "Installing .NET Core 3.1 SDK..."
-        Start-Process -file $dotnetInstaller -arg '/Install /Quiet /Norestart /Logs logCore31SDK.txt' -passthru | wait-process
-    }
 
     # Copy Web Site Files
     Wait-Install

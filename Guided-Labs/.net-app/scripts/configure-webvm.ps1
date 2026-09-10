@@ -41,6 +41,53 @@ $trainerUserPassword="$adminPassword"
 
 Install-WindowsFeature -name Web-Server -IncludeManagementTools
 
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+# IIS cannot serve the Parts Unlimited site without the ASP.NET Core module. The site's
+# web.config declares modules="AspNetCoreModuleV2" and an <aspNetCore> element, both of
+# which come from the ASP.NET Core Hosting Bundle - not from the runtime or the SDK. With
+# the bundle missing, IIS cannot even parse web.config and returns:
+#   HTTP 500.19 - Internal Server Error, Error Code 0x8007000d
+# The old image staged C:\dotnet-sdk-3.1.413-win-x64.exe; the WS2025 image does not, so
+# install both here: as SYSTEM, before the reboot, and *after* IIS, because the bundle
+# only registers the module if IIS is already present.
+# Note: dotnetcli.azureedge.net is retired - builds.dotnet.microsoft.com replaces it.
+function Install-FromWeb {
+    param(
+        [string] $Name,
+        [string] $Uri,
+        [string] $OutFile,
+        [string] $Arguments
+    )
+    try {
+        Write-Host "Downloading $Name" -ForegroundColor Green
+        (New-Object System.Net.WebClient).DownloadFile($Uri, $OutFile)
+        Write-Host "Installing $Name"
+        $proc = Start-Process -FilePath $OutFile -ArgumentList $Arguments -Wait -PassThru
+        if ($proc.ExitCode -eq 0) {
+            Write-Host "$Name installed"
+        } else {
+            Write-Warning "$Name installer exited with code $($proc.ExitCode)"
+        }
+    }
+    catch {
+        Write-Error "$Name could not be installed: $($_.Exception.Message)"
+    }
+}
+
+Install-FromWeb -Name "ASP.NET Core 3.1 Hosting Bundle" `
+    -Uri "https://builds.dotnet.microsoft.com/dotnet/aspnetcore/Runtime/3.1.32/dotnet-hosting-3.1.32-win.exe" `
+    -OutFile "C:\dotnet-hosting-3.1.32-win.exe" -Arguments "/quiet /norestart"
+
+# Exercise 6 builds the Function App project from VS Code, which needs the SDK, not just
+# the runtime the hosting bundle brings.
+Install-FromWeb -Name ".NET Core 3.1 SDK" `
+    -Uri "https://builds.dotnet.microsoft.com/dotnet/Sdk/3.1.426/dotnet-sdk-3.1.426-win-x64.exe" `
+    -OutFile "C:\dotnet-sdk-3.1.426-win-x64.exe" -Arguments "/quiet /norestart"
+
+Write-Host "Restarting IIS so it picks up the ASP.NET Core module"
+iisreset.exe /restart
+
 $branchName = "microsoft-app-modernization-v2"
 
 # The lab deployment scripts live next to this one in the labfiles repo. Download the ones
@@ -84,11 +131,17 @@ if (Test-Path -Path $repoCheckFile -PathType Leaf) {
     Write-Error "Lab source code was not extracted to $repoRoot - exercises 5 and 6 will fail"
 }
 
-# Replace SQL Connection String
+# Replace SQL Connection String.
+# TrustServerCertificate=True is required: SQL Server 2019 presents a self-signed
+# certificate, and Microsoft.Data.SqlClient 4.0+ (which this site ships) defaults to
+# Encrypt=True with certificate validation, so the app would otherwise fail with
+# "The certificate chain was issued by an authority that is not trusted".
+# This is the same reason the lab guide has learners tick "Trust server certificate" in SSMS.
 $item = $repoRoot
-Write-Host "Server=$SqlIP;Database=PartsUnlimited;User Id=PUWebSite;Password=$SqlPass;"
+$sqlConnectionString = "Server=$SqlIP;Database=PartsUnlimited;User Id=PUWebSite;Password=$adminPassword;TrustServerCertificate=True;"
+Write-Host "Connection string: Server=$SqlIP;Database=PartsUnlimited;User Id=PUWebSite;Password=***;TrustServerCertificate=True;"
 # The config.release.json file is populated with configuration data during compile and release from VS.  config.json is used by the solution on the WebM.
-((Get-Content -path "$item\Hands-on lab\lab-files\src\src\PartsUnlimitedWebsite\config.release.json" -Raw) -replace 'SETCONNECTIONSTRING',"Server=$SqlIP;Database=PartsUnlimited;User Id=PUWebSite;Password=$adminPassword;") | Set-Content -Path "$item\Hands-on lab\lab-files\src\src\PartsUnlimitedWebsite\config.json"
+((Get-Content -path "$item\Hands-on lab\lab-files\src\src\PartsUnlimitedWebsite\config.release.json" -Raw) -replace 'SETCONNECTIONSTRING',$sqlConnectionString) | Set-Content -Path "$item\Hands-on lab\lab-files\src\src\PartsUnlimitedWebsite\config.json"
 
 #Import Common Functions
 $path = pwd
