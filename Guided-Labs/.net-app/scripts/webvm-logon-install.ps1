@@ -3,6 +3,12 @@ Start-Transcript -Path C:\WindowsAzure\Logs\CloudLabsCustomScriptExtension1.txt 
 $commonscriptpath = "replacepath\cloudlabs-common\cloudlabs-windows-functions.ps1"
 . $commonscriptpath
 
+# Both placeholders are substituted by configure-webvm.ps1 before this script is scheduled.
+# $SqlPass is handed to sqlvm-logontask.ps1 at the bottom so it can make certain the
+# PartsUnlimited database and the PUWebSite login exist on the SQL VM. Single quotes,
+# so a password containing $ is not read as a PowerShell variable once substituted.
+$SqlPass = 'replacesqlpass'
+
 
 function Wait-Install {
     $msiRunning = 1
@@ -138,7 +144,24 @@ function Deploy-Website {
     }
 }
 
-Deploy-Website
+# configure-webvm.ps1 already deployed the site as SYSTEM, before the reboot. This is only
+# here for the case where that did not happen - re-expanding over a working site buys
+# nothing and risks locking its DLLs.
+if (Test-Path -Path 'C:\inetpub\wwwroot\PartsUnlimitedWebsite.dll' -PathType Leaf) {
+    Write-Host "Parts Unlimited site is already deployed - leaving it alone"
+} else {
+    Write-Warning "Parts Unlimited site is not deployed - deploying it now"
+    Deploy-Website
+}
+
+# Exercise 5 drives git from a command window and Exercises 5 and 6 both open Visual Studio
+# Code, so the lab cannot be completed without them. They are installed here rather than in
+# configure-webvm.ps1 so that they do not add to the ARM deployment time - by the time this
+# runs the deployment has already been reported complete and the learner is still reading
+# the introduction.
+InstallChocolatey
+InstallGitTools
+InstallVSCode
 
 Unregister-ScheduledTask -TaskName "Install Lab Requirements" -Confirm:$false
 
@@ -257,17 +280,20 @@ else{
 
 Sleep 50
 
-# Safety net only: configure-sqlvm.ps1 already installs the Data Migration Assistant and
-# verifies it, and sqlvm-logontask.ps1 no-ops when it is present. So this must not be able
-# to fail the post-deployment status - Az.Compute is the module most likely to break on
-# this image, and losing a no-op is not worth reporting the deployment as failed.
+# Last chance to make the SQL VM lab-ready. configure-sqlvm.ps1 already creates the
+# PartsUnlimited database and installs the Data Migration Assistant and the Integration
+# Runtime, and sqlvm-logontask.ps1 no-ops on everything that is already there - but that
+# script ran minutes after the SQL VM's first boot, and this runs after both VMs are fully
+# up, so it is the one place that can still fix a database that did not get created.
+# It must not be able to fail the post-deployment status: Az.Compute is the module most
+# likely to break on this image, and losing a no-op is not worth failing a deployment.
 try {
-    Invoke-AzVMRunCommand -ResourceGroupName "hands-on-lab-$DeploymentID" -Name 'SqlServer2008' -CommandId 'RunPowerShellScript' -ScriptPath "C:\LabFiles\scripts\sqlvm-logontask.ps1" -ErrorAction Stop
+    Invoke-AzVMRunCommand -ResourceGroupName "hands-on-lab-$DeploymentID" -Name 'SqlServer2008' -CommandId 'RunPowerShellScript' -ScriptPath "C:\LabFiles\scripts\sqlvm-logontask.ps1" -Parameter @{ SqlPass = $SqlPass } -ErrorAction Stop
     Write-Host "sqlvm-logontask.ps1 ran on SqlServer2008"
 }
 catch {
     Write-Warning "Could not run sqlvm-logontask.ps1 on SqlServer2008: $($_.Exception.Message)"
-    Write-Warning "The Data Migration Assistant is installed by configure-sqlvm.ps1 - verify it on the SQL VM if Exercise 4 cannot find it."
+    Write-Warning "configure-sqlvm.ps1 does the same work at deployment time - check its transcript on the SQL VM if the PartsUnlimited database or the Exercise 4 tools are missing."
 }
 
 CloudlabsManualAgent setStatus

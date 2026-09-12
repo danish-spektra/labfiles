@@ -143,12 +143,83 @@ Write-Host "Connection string: Server=$SqlIP;Database=PartsUnlimited;User Id=PUW
 # The config.release.json file is populated with configuration data during compile and release from VS.  config.json is used by the solution on the WebM.
 ((Get-Content -path "$item\Hands-on lab\lab-files\src\src\PartsUnlimitedWebsite\config.release.json" -Raw) -replace 'SETCONNECTIONSTRING',$sqlConnectionString) | Set-Content -Path "$item\Hands-on lab\lab-files\src\src\PartsUnlimitedWebsite\config.json"
 
+# Deploy the Parts Unlimited site into IIS now, while this script is still running as
+# NT AUTHORITY\SYSTEM.
+#
+# This used to happen only in webvm-logon-install.ps1, which Task Scheduler runs as
+# demouser. demouser is an administrator, but a scheduled task gets a UAC-filtered token,
+# and both iisreset and writing to C:\inetpub\wwwroot need the unfiltered one - so the copy
+# failed with "Access to the path ... is denied" and http://localhost served the IIS default
+# page instead of the application. Running the same steps as SYSTEM removes the dependency
+# on a logon happening at all: the site is in place before the VM reboots.
+# webvm-logon-install.ps1 keeps a copy of this as a safety net, but it is a no-op now.
+function Deploy-PartsUnlimitedSite {
+    param([string] $RepoRoot)
+
+    $siteZip    = "$RepoRoot\Hands-on lab\lab-files\PartsUnlimitedWebsite.zip"
+    $configJson = "$RepoRoot\Hands-on lab\lab-files\src\src\PartsUnlimitedWebsite\config.json"
+    $webRoot    = 'C:\inetpub\wwwroot'
+
+    if (-not (Test-Path -Path $siteZip -PathType Leaf)) {
+        Write-Error "$siteZip is missing - the site cannot be deployed"
+        return
+    }
+
+    # Stop IIS first. Now that the ASP.NET Core module is installed, w3wp actually loads the
+    # app and holds its DLLs open, and Expand-Archive -Force deletes each existing file
+    # before rewriting it - which fails against a running app pool.
+    Write-Host "Stopping IIS so the site files are not locked"
+    iisreset.exe /stop
+
+    try {
+        Write-Host "Copying default website files..."
+        Expand-Archive -LiteralPath $siteZip -DestinationPath $webRoot -Force
+
+        Write-Host "Updating config.json with the SQL IP Address and connection string information."
+        Copy-Item $configJson -Destination $webRoot -Force
+
+        # The shipped web.config sends stdout to '\\?\%home%\LogFiles\stdout', which is an
+        # App Service path - %home% does not exist on IIS, so the module logs "Could not
+        # start stdout file redirection" and the app's own exceptions go nowhere. Repoint it
+        # at a real folder so a request-time 500 (a bad connection string, an unreachable
+        # database) is diagnosable from the VM instead of needing another deployment.
+        $webConfig = Join-Path $webRoot 'web.config'
+        $stdoutDir = 'C:\inetpub\logs\stdout'
+        New-Item -ItemType Directory -Path $stdoutDir -Force | Out-Null
+        if (Test-Path $webConfig) {
+            (Get-Content $webConfig -Raw).Replace('\\?\%home%\LogFiles\stdout', "$stdoutDir\stdout") |
+                Set-Content -Path $webConfig -Encoding UTF8
+            Write-Host "  app stdout log -> $stdoutDir\stdout*.log"
+        }
+    }
+    finally {
+        Write-Host "Starting IIS"
+        iisreset.exe /start
+    }
+
+    # The app cannot start without these, so fail loudly here rather than at the HTTP check.
+    foreach ($required in 'PartsUnlimitedWebsite.dll', 'web.config', 'config.json') {
+        if (Test-Path (Join-Path $webRoot $required)) {
+            Write-Host "  $required deployed"
+        } else {
+            Write-Error "  $required is MISSING from $webRoot"
+        }
+    }
+}
+
+Deploy-PartsUnlimitedSite -RepoRoot $repoRoot
+
 #Import Common Functions
 $path = pwd
 $path=$path.Path
 $commonscriptpath = "$path" + "\cloudlabs-common\cloudlabs-windows-functions.ps1"
 . $commonscriptpath
 
+# webvm-logon-install.ps1 dot-sources these same functions after the reboot. It used to be
+# pointed at the CustomScriptExtension Downloads folder, which is documented as not durable
+# over the life of the VM, so keep a copy somewhere that is and point the logon script there.
+Copy-Item -Path "$path\cloudlabs-common" -Destination "C:\LabFiles" -Recurse -Force
+$commonRoot = "C:\LabFiles"
 
 # Enable Embedded shadow
 Enable-CloudLabsEmbeddedShadow $vmAdminUsername $trainerUserName $trainerUserPassword
@@ -158,17 +229,27 @@ CloudLabsManualAgent Install
 CreateCredFile $AzureUserName $AzurePassword $AzureTenantID $AzureSubscriptionID $DeploymentID
 az provider register --namespace "Microsoft.LoadTestService"
 
+# The original template did this via the cloudlabs-common WindowsServerCommon helper. IIS
+# opens port 80 for itself, but the lab also reaches the VM on other ports and the HTTP
+# check in the logon script calls the VM back on its public IP.
+DisableWindowsFirewall
+
 # Schedule Installs for first Logon
 $argument = "-File `"$labScriptsPath\webvm-logon-install.ps1`""
 $triggerAt = New-ScheduledTaskTrigger -AtLogOn -User demouser
 $action = New-ScheduledTaskAction -Execute "powershell" -Argument $argument 
-Register-ScheduledTask -TaskName "Install Lab Requirements" -Trigger $triggerAt -Action $action -User demouser
+# -RunLevel Highest: without it the task runs under demouser's UAC-filtered token, which
+# cannot write to C:\inetpub\wwwroot, run iisreset, or install anything machine-wide.
+Register-ScheduledTask -TaskName "Install Lab Requirements" -Trigger $triggerAt -Action $action -User demouser -RunLevel Highest
 
-#Replace Path
-# $path is this script's working directory, where the extension also placed
-# cloudlabs-common\cloudlabs-windows-functions.ps1 for the logon script to dot-source.
-
-(Get-Content "$labScriptsPath\webvm-logon-install.ps1") -replace "replacepath","$path" | Set-Content "$labScriptsPath\webvm-logon-install.ps1" -Verbose
+#Replace the placeholders in the logon script.
+#   replacepath    -> where it dot-sources cloudlabs-windows-functions.ps1 from
+#   replacesqlpass -> the SQL password it hands to sqlvm-logontask.ps1 on the SQL VM
+# .Replace() rather than -replace: these are literal strings, and -replace would treat $ in
+# a password as a regex substitution.
+$logonScript = "$labScriptsPath\webvm-logon-install.ps1"
+(Get-Content $logonScript -Raw).Replace('replacepath', $commonRoot).Replace('replacesqlpass', $adminPassword) |
+    Set-Content -Path $logonScript
 
 #Autologin
 $Username = "demouser"

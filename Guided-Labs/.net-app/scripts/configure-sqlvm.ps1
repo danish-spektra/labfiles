@@ -144,20 +144,17 @@ function Invoke-SqlAsVmAdmin {
     # Its own transcript, because this runs in a separate process whose output the
     # extension never sees.
     $lines = @(
-        'Start-Transcript -Path C:\WindowsAzure\Logs\cloudlabs-sql-fallback.txt -Append',
-        '$ErrorActionPreference = ''Stop''',
-        'try {'
+        'Start-Transcript -Path C:\WindowsAzure\Logs\cloudlabs-sql-fallback.txt -Append'
     )
     foreach ($statement in $Statements) {
         # Emitted inside single quotes, so double any single quotes in the T-SQL.
         $escaped = $statement.Replace("'", "''")
-        $lines += "    Invoke-Sqlcmd '$escaped' -ServerInstance '$($SqlArgs.ServerInstance)' -QueryTimeout 3600$trust"
+        # One try per statement, for the same reason as the direct path above: these are
+        # independent statements, so one failure must not skip the rest of them.
+        $lines += "try { Invoke-Sqlcmd '$escaped' -ServerInstance '$($SqlArgs.ServerInstance)' -QueryTimeout 3600$trust -ErrorAction Stop }"
+        $lines += 'catch { Write-Host "FALLBACK STATEMENT FAILED: $($_.Exception.Message)" }'
     }
-    $lines += @(
-        '}',
-        'catch { Write-Host "FALLBACK FAILED: $($_.Exception.Message)" }',
-        'Stop-Transcript'
-    )
+    $lines += 'Stop-Transcript'
     Set-Content -Path $scriptPath -Value $lines -Encoding UTF8
 
     try {
@@ -265,16 +262,26 @@ function Setup-Sql {
     )
 
     if ($canCreate) {
+        # Each statement is run on its own and a failure does not stop the ones after it.
+        # They are independent, and wrapping the whole set in a single try meant one
+        # recoverable failure took out everything downstream of it: ALTER DATABASE ... SET
+        # DISABLE_BROKER needs exclusive access to the database, so it loses to anything
+        # else that happens to be connected at that moment, and when it did the CREATE LOGIN
+        # below it never ran. The database then existed with no PUWebSite login, and the web
+        # site came up as HTTP 500 with "Login failed for user 'PUWebSite'".
         for ($attempt = 1; $attempt -le 3; $attempt++) {
-            try {
-                Write-Host "Configuring $DatabaseName (attempt $attempt)"
-                foreach ($statement in $statements) { Invoke-Sqlcmd $statement @sqlArgs -ErrorAction Stop }
-                break
+            Write-Host "Configuring $DatabaseName (attempt $attempt)"
+            foreach ($statement in $statements) {
+                try {
+                    Invoke-Sqlcmd $statement @sqlArgs -ErrorAction Stop
+                }
+                catch {
+                    Write-Warning "Statement failed: $statement"
+                    Write-Warning "  $($_.Exception.Message)"
+                }
             }
-            catch {
-                Write-Warning "Attempt $attempt failed: $($_.Exception.Message)"
-                Start-Sleep -Seconds 15
-            }
+            if (Test-SqlObjects -SqlArgs $sqlArgs -DatabaseName $DatabaseName) { break }
+            Start-Sleep -Seconds 15
         }
     }
     else {
@@ -339,6 +346,37 @@ if (Test-DmaInstalled) {
     Write-Host "Data Migration Assistant is installed"
 } else {
     Write-Error "Data Migration Assistant did not install - see C:\dma_install.txt"
+}
+
+# Exercise 4, Task 5 has the learner open "Microsoft Integration Runtime" from the Start
+# menu on this VM and register it against the Database Migration Service with a key from
+# the portal. The self-hosted integration runtime therefore has to already be installed
+# here - the original template installed it and it was lost in the rewrite, which leaves
+# that task with nothing to open.
+function Test-IntegrationRuntimeInstalled {
+    $uninstallKeys = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    )
+    [bool](Get-ItemProperty $uninstallKeys -ErrorAction SilentlyContinue |
+           Where-Object { $_.DisplayName -like '*Integration Runtime*' })
+}
+
+if (-not (Test-IntegrationRuntimeInstalled)) {
+    Write-Host "Installing the Microsoft Integration Runtime" -ForegroundColor Green
+    try {
+        (New-Object System.Net.WebClient).DownloadFile('https://download.microsoft.com/download/E/4/7/E4771905-1079-445B-8BF9-8A1A075D8A10/IntegrationRuntime_5.52.9231.1.msi', 'C:\IntegrationRuntime.msi')
+        Start-Process msiexec.exe -ArgumentList '/i "C:\IntegrationRuntime.msi" /quiet /norestart /log "C:\IntegrationRuntime_Install.log"' -Wait
+    }
+    catch {
+        Write-Warning "Integration Runtime install failed: $($_.Exception.Message)"
+    }
+}
+
+if (Test-IntegrationRuntimeInstalled) {
+    Write-Host "Microsoft Integration Runtime is installed"
+} else {
+    Write-Error "Microsoft Integration Runtime did not install - Exercise 4, Task 5 will have nothing to register. See C:\IntegrationRuntime_Install.log"
 }
 
 Stop-Transcript
