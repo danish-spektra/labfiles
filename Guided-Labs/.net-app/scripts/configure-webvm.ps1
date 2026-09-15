@@ -90,6 +90,10 @@ iisreset.exe /restart
 
 $branchName = "microsoft-app-modernization-v2"
 
+# Published in the labfiles repo alongside the scripts. Swap this one string to point
+# at a release asset or a tag if you want a fixed target that a push to main cannot move.
+$labFilesUri = "https://raw.githubusercontent.com/danish-spektra/labfiles/main/Guided-Labs/.net-app/lab-files.zip"
+
 # The lab deployment scripts live next to this one in the labfiles repo. Download the ones
 # that run after this script to a stable path - the CustomScriptExtension Downloads folder
 # is documented as not durable over the life of the VM, and these run after a reboot.
@@ -106,29 +110,39 @@ foreach ($scriptName in @("webvm-logon-install.ps1", "sqlvm-logontask.ps1")) {
     Invoke-WebRequest -Uri "$ScriptsBaseUri/$scriptName" -OutFile "$labScriptsPath\$scriptName" -UseBasicParsing
 }
 
-# Download and extract the lab source code - the Parts Unlimited solution that exercises
-# 5 and 6 open from C:\MCW. Only the source code comes from the repo; the scripts above
-# come from the templates container.
+# Download and extract the lab files - the Parts Unlimited solution and site that
+# exercises 5 and 6 open from C:\MCW.
 #
-# Use the archive/refs/heads endpoint, not zipball: it extracts straight to
-# MCW-App-modernization-<branch>, which is the folder name the lab guide has hard-coded,
-# so no rename is needed. Retry because the ZIP occasionally arrives corrupted, and
-# verify against a file the later steps actually need.
+# This used to pull the whole CloudLabs-MCW/MCW-App-modernization repo from GitHub: a
+# 155 MB archive, most of it the lab guide's own screenshots, to use about 59 MB of it.
+# It now pulls a 54 MB bundle of just "Hands-on lab\lab-files", published next to the
+# other lab artefacts, so the deployment no longer depends on a repo we do not control
+# and does not download a hundred megabytes of images onto every WebVM.
+#
+# The bundle's internal layout is "Hands-on lab\lab-files\..." and it extracts to
+# C:\MCW\MCW-App-modernization-<branch>, so every path the lab guide hard-codes stays
+# exactly as it is - no exercise changes. Do not flatten it:
+#   ...\lab-files\PartsUnlimitedWebsite.zip                    the IIS site
+#   ...\lab-files\src\                                         Exercise 5
+#   ...\lab-files\src\src\PartsUnlimitedWebsite\config.release.json  connection string
+#   ...\lab-files\src-invoicing-functions\FunctionApp\         Exercise 6, Task 1
 $repoRoot = "C:\MCW\MCW-App-modernization-$branchName"
 $repoCheckFile = "$repoRoot\Hands-on lab\lab-files\PartsUnlimitedWebsite.zip"
 
-New-Item -ItemType Directory -Path C:\MCW -Force | Out-Null
+New-Item -ItemType Directory -Path $repoRoot -Force | Out-Null
 
+# Retry because the ZIP occasionally arrives corrupted, and verify against a file the
+# later steps actually need rather than trusting that the download succeeded.
 for ($attempt = 1; $attempt -le 5 -and -not (Test-Path -Path $repoCheckFile -PathType Leaf); $attempt++) {
-    Write-Host "Downloading MCW-App-modernization from GitHub (attempt $attempt)" -ForegroundColor Green
-    (New-Object System.Net.WebClient).DownloadFile("https://github.com/CloudLabs-MCW/MCW-App-modernization/archive/refs/heads/$branchName.zip", 'C:\MCW.zip')
-    Expand-Archive -LiteralPath 'C:\MCW.zip' -DestinationPath 'C:\MCW' -Force
-}
-
-if (Test-Path -Path $repoCheckFile -PathType Leaf) {
-    Write-Host "Lab source code extracted to $repoRoot"
-} else {
-    Write-Error "Lab source code was not extracted to $repoRoot - exercises 5 and 6 will fail"
+    Write-Host "Downloading lab files from $labFilesUri (attempt $attempt)" -ForegroundColor Green
+    try {
+        (New-Object System.Net.WebClient).DownloadFile($labFilesUri, 'C:\lab-files.zip')
+        Expand-Archive -LiteralPath 'C:\lab-files.zip' -DestinationPath $repoRoot -Force
+    }
+    catch {
+        Write-Warning "Attempt ${attempt} failed: $($_.Exception.Message)"
+        Start-Sleep -Seconds 10
+    }
 }
 
 # Replace SQL Connection String.
