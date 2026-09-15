@@ -186,6 +186,12 @@ function Deploy-PartsUnlimitedSite {
         $webConfig = Join-Path $webRoot 'web.config'
         $stdoutDir = 'C:\inetpub\logs\stdout'
         New-Item -ItemType Directory -Path $stdoutDir -Force | Out-Null
+        # The module writes this log as the app pool identity, which only inherits read
+        # from C:\inetpub\logs. Without this grant it logs
+        #   Could not start stdout file redirection ... create_directories: Access is denied
+        # and the app's own exceptions go nowhere - which is the one thing this redirect
+        # exists to capture. IIS_IUSRS covers ApplicationPoolIdentity.
+        icacls $stdoutDir /grant "IIS_IUSRS:(OI)(CI)M" | Out-Null
         if (Test-Path $webConfig) {
             (Get-Content $webConfig -Raw).Replace('\\?\%home%\LogFiles\stdout', "$stdoutDir\stdout") |
                 Set-Content -Path $webConfig -Encoding UTF8

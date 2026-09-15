@@ -123,6 +123,12 @@ function Deploy-Website {
         $webConfig = Join-Path $webRoot 'web.config'
         $stdoutDir = 'C:\inetpub\logs\stdout'
         New-Item -ItemType Directory -Path $stdoutDir -Force | Out-Null
+        # The module writes this log as the app pool identity, which only inherits read
+        # from C:\inetpub\logs. Without this grant it logs
+        #   Could not start stdout file redirection ... create_directories: Access is denied
+        # and the app's own exceptions go nowhere - which is the one thing this redirect
+        # exists to capture. IIS_IUSRS covers ApplicationPoolIdentity.
+        icacls $stdoutDir /grant "IIS_IUSRS:(OI)(CI)M" | Out-Null
         if (Test-Path $webConfig) {
             (Get-Content $webConfig -Raw).Replace('\\?\%home%\LogFiles\stdout', "$stdoutDir\stdout") |
                 Set-Content -Path $webConfig -Encoding UTF8
@@ -189,30 +195,90 @@ foreach ($azModule in @('Az.Accounts', 'Az.Network', 'Az.Compute')) {
     }
 }
 
-Connect-AzAccount -Credential $cred
+# Everything Azure-facing below is wrapped, and none of it decides the post-deployment
+# status. The lab user's role assignments are still being applied while this script runs,
+# and a failed ARM call used to be indistinguishable from a broken website - which is how
+# a role-assignment problem ended up reported as "Post Deployment Failed".
+try {
+    Connect-AzAccount -Credential $cred -ErrorAction Stop | Out-Null
+    Write-Host "Signed in to Azure as $AzureUserName"
+}
+catch {
+    Write-Warning "Could not sign in to Azure: $($_.Exception.Message)"
+    Write-Warning "The website check below does not need Azure, so this does not fail the deployment."
+}
 
-Start-Sleep 200
-$k = 0 
-for ($i=1; ($i + $k) -le 7; $i++)
-{
-    $vmipdetails=Get-AzPublicIpAddress -ResourceGroupName "hands-on-lab-$DeploymentID" -Name "WebVM-ip" 
+# Make the SQL VM lab-ready BEFORE judging the website, not after.
+#
+# This used to be the last thing in the script, running minutes after the verdict had
+# already been written. So on a deployment where the database was missing, the site was
+# marked failed for exactly the problem this call then went and fixed. The web app cannot
+# render its home page without the database, so the repair has to come first.
+try {
+    Invoke-AzVMRunCommand -ResourceGroupName "hands-on-lab-$DeploymentID" -Name 'SqlServer2008' -CommandId 'RunPowerShellScript' -ScriptPath "C:\LabFiles\scripts\sqlvm-logontask.ps1" -Parameter @{ SqlPass = $SqlPass } -ErrorAction Stop
+    Write-Host "sqlvm-logontask.ps1 ran on SqlServer2008"
+}
+catch {
+    Write-Warning "Could not run sqlvm-logontask.ps1 on SqlServer2008: $($_.Exception.Message)"
+    Write-Warning "configure-sqlvm.ps1 does the same work at deployment time - check its transcript on the SQL VM if the PartsUnlimited database or the Exercise 4 tools are missing."
+}
 
-    $vmip=$vmipdetails.IpAddress
- 
-    $url="http://"+$vmip
-
-    $HTTP_Request = [System.Net.WebRequest]::Create($url)
-
-    $HTTP_Request.timeout = 120000; #2 Minutes
-
-    # Reset per attempt so a previous result cannot be mistaken for this one, and catch
-    # the connection failure that getResponse throws while IIS is still starting - it
-    # used to surface as an unhandled error in the transcript.
-    $HTTP_Status = 0
-    $HTTP_Response = $null
+# Say whether the app can reach its database, using the app's own connection string.
+#
+# An HTTP 500 from this site is almost always the database. Without this the transcript
+# says "500" and nothing else, and the ASP.NET Core stdout log - the only other place the
+# exception would appear - is not guaranteed to be there.
+function Test-LabDatabase {
+    $configPath = 'C:\inetpub\wwwroot\config.json'
+    if (-not (Test-Path -Path $configPath -PathType Leaf)) {
+        Write-Warning "  $configPath is missing - the site has no connection string"
+        return
+    }
 
     try {
-        $HTTP_Response = $HTTP_Request.getResponse()
+        $connectionString = (Get-Content $configPath -Raw | ConvertFrom-Json).ConnectionStrings.DefaultConnectionString
+    }
+    catch {
+        Write-Warning "  could not read the connection string from $configPath : $($_.Exception.Message)"
+        return
+    }
+
+    $connection = New-Object System.Data.SqlClient.SqlConnection $connectionString
+    try {
+        $connection.Open()
+        Write-Host "  database reachable - the PartsUnlimited connection string works"
+    }
+    catch {
+        Write-Warning "  DATABASE UNREACHABLE: $($_.Exception.Message)"
+    }
+    finally {
+        $connection.Dispose()
+    }
+}
+
+# Check the site on localhost, exactly as Exercise 1, Task 1 has the learner do it.
+#
+# This used to call Get-AzPublicIpAddress and then request the public IP. That made the
+# health check depend on the lab user holding Microsoft.Network/publicIPAddresses/read at
+# the moment it ran: when that read returned nothing, $vmip was empty, the URL became the
+# bare string "http://", every attempt threw, and the environment was reported as failed
+# while the website was in fact serving. Whether IIS is up has nothing to do with the
+# learner's role assignments, so the check no longer asks Azure anything at all.
+$url = "http://localhost"
+$HTTP_Status = 0
+
+# The SQL VM reboots at the end of its own setup script. Sleeping between attempts rather
+# than racing through all seven in under a minute is what gives it room to come back.
+Start-Sleep -Seconds 60
+
+for ($i = 1; $i -le 7 -and $HTTP_Status -ne 200; $i++) {
+    Write-Host "Checking the status of website in the attempt $i"
+
+    $HTTP_Response = $null
+    try {
+        $HTTP_Request = [System.Net.WebRequest]::Create($url)
+        $HTTP_Request.Timeout = 120000
+        $HTTP_Response = $HTTP_Request.GetResponse()
         $HTTP_Status = [int]$HTTP_Response.StatusCode
     }
     catch {
@@ -222,78 +288,39 @@ for ($i=1; ($i + $k) -le 7; $i++)
         if ($HTTP_Response) { $HTTP_Response.Close() }
     }
 
-    Write-Host "Checking the status of website in the attempt $i"
-    
-if ($HTTP_Status -eq 200) {
-     $k = 8
-     $Validstatus="Succeeded"  ##Failed or Successful at the last step
-     $Validmessage="Post Deployment is successful"
-     Write-Host "Post Deployment is successful"
-    }
-else{
-    # Do NOT re-expand the site files here. Deploy-Website already placed them with IIS
-    # stopped, and re-expanding over a running app pool is what produced
-    # "Access to the path ... is denied" on the EntityFrameworkCore DLLs. Re-extracting the
-    # same zip up to seven times has never fixed a 500 anyway - the causes seen so far were
-    # a missing ASP.NET Core module and a missing database, neither fixed by copying files.
-    # Restart the app and report why it is failing instead.
-    Write-Host "Restarting IIS and re-checking"
-    iisreset.exe /restart
+    if ($HTTP_Status -eq 200) { break }
 
-    # Whatever is making the app return 500 is recorded by the ASP.NET Core module, so
-    # surface it in this transcript rather than needing another deployment to find it.
-    $ancmEvents = Get-WinEvent -LogName Application -MaxEvents 200 -ErrorAction SilentlyContinue |
-        Where-Object { $_.ProviderName -like '*AspNetCore*' -or $_.ProviderName -eq 'IIS AspNetCore Module V2' } |
-        Select-Object -First 3
+    Test-LabDatabase
+
+    $ancmEvents = Get-WinEvent -LogName Application -MaxEvents 200 -ErrorAction SilentlyContinue | Where-Object { $_.ProviderName -like '*AspNetCore*' -or $_.ProviderName -eq 'IIS AspNetCore Module V2' } | Select-Object -First 3
     if ($ancmEvents) {
         Write-Host "--- most recent ASP.NET Core module events ---"
         $ancmEvents | ForEach-Object { Write-Host "[$($_.TimeCreated)] $($_.Message)" }
         Write-Host "--- end ---"
     }
 
-    # If the module reports the app started but requests still 500, the exception is the
-    # app's own - and it is almost always the database. This is where it says so.
-    $stdoutLog = Get-ChildItem 'C:\inetpub\logs\stdout\stdout*.log' -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    $stdoutLog = Get-ChildItem 'C:\inetpub\logs\stdout\stdout*.log' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
     if ($stdoutLog) {
         Write-Host "--- tail of $($stdoutLog.Name) ---"
         Get-Content $stdoutLog.FullName -Tail 25
         Write-Host "--- end ---"
     }
-}
-}
 
-sleep 120
+    Write-Host "Restarting IIS and re-checking"
+    iisreset.exe /restart
+    Start-Sleep -Seconds 60
+}
 
 if ($HTTP_Status -eq 200) {
-     $k = 8
-     $Validstatus="Succeeded"  ##Failed or Successful at the last step
-     $Validmessage="Post Deployment is successful"
-     Write-Host "Post Deployment is successful"
-    }
-else{
-    Write-Warning "Validation Failed - see log output"
-    $Validstatus="Failed"  ##Failed or Successful at the last step
-    $Validmessage="Post Deployment Failed"
-     Write-Host "Post Deployment Failed"
-} 
-
-Sleep 50
-
-# Last chance to make the SQL VM lab-ready. configure-sqlvm.ps1 already creates the
-# PartsUnlimited database and installs the Data Migration Assistant and the Integration
-# Runtime, and sqlvm-logontask.ps1 no-ops on everything that is already there - but that
-# script ran minutes after the SQL VM's first boot, and this runs after both VMs are fully
-# up, so it is the one place that can still fix a database that did not get created.
-# It must not be able to fail the post-deployment status: Az.Compute is the module most
-# likely to break on this image, and losing a no-op is not worth failing a deployment.
-try {
-    Invoke-AzVMRunCommand -ResourceGroupName "hands-on-lab-$DeploymentID" -Name 'SqlServer2008' -CommandId 'RunPowerShellScript' -ScriptPath "C:\LabFiles\scripts\sqlvm-logontask.ps1" -Parameter @{ SqlPass = $SqlPass } -ErrorAction Stop
-    Write-Host "sqlvm-logontask.ps1 ran on SqlServer2008"
+    $Validstatus  = "Succeeded"
+    $Validmessage = "Post Deployment is successful"
+    Write-Host "Post Deployment is successful"
 }
-catch {
-    Write-Warning "Could not run sqlvm-logontask.ps1 on SqlServer2008: $($_.Exception.Message)"
-    Write-Warning "configure-sqlvm.ps1 does the same work at deployment time - check its transcript on the SQL VM if the PartsUnlimited database or the Exercise 4 tools are missing."
+else {
+    Write-Warning "Validation Failed - see log output"
+    $Validstatus  = "Failed"
+    $Validmessage = "Post Deployment Failed"
+    Write-Host "Post Deployment Failed"
 }
 
 CloudlabsManualAgent setStatus
