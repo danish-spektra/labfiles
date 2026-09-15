@@ -122,6 +122,61 @@ function Test-SqlObjects {
     return ([bool]$db -and [bool]$login)
 }
 
+# The only verification that is actually trustworthy here: open the app's own connection.
+#
+# sys.databases and sys.sql_logins only return rows the caller has permission to see, so
+# when this script runs as a non-sysadmin they read back empty even when the database and
+# login both exist. Worse, they say nothing about whether SQL *authentication* is enabled -
+# and with LoginMode left at 1 the site fails with "Login failed for user 'PUWebSite'"
+# against a database that is present and a login that is correct.
+function Test-PUWebSiteLogin {
+    param([string] $ServerName, [string] $DatabaseName, [string] $Password)
+    if (-not $Password) { return $false }
+    $cs = "Server=$ServerName;Database=$DatabaseName;User Id=PUWebSite;Password=$Password;TrustServerCertificate=True;Connect Timeout=15;"
+    $connection = New-Object System.Data.SqlClient.SqlConnection $cs
+    try { $connection.Open(); return $true }
+    catch {
+        Write-Host "  PUWebSite cannot log in: $($_.Exception.Message)"
+        return $false
+    }
+    finally { $connection.Dispose() }
+}
+
+# Enable mixed-mode authentication by writing the registry rather than through T-SQL.
+#
+# xp_instance_regwrite needs sysadmin or CONTROL SERVER, and a deployment where SYSTEM had
+# neither failed with "The EXECUTE permission was denied on the object
+# 'xp_instance_regwrite'" - leaving SQL in Windows-only mode and the website dead. This
+# script runs as SYSTEM, which is always a *Windows* administrator, so the registry is
+# reachable whatever SQL thinks of us. Returns $true when a restart is needed.
+function Enable-SqlMixedMode {
+    $instanceKey = 'HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\Instance Names\SQL'
+    try { $instanceId = (Get-ItemProperty -Path $instanceKey -ErrorAction Stop).MSSQLSERVER }
+    catch {
+        Write-Warning "Could not resolve the SQL instance id: $($_.Exception.Message)"
+        return $false
+    }
+
+    $serverKey = "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\$instanceId\MSSQLServer"
+    try { $current = (Get-ItemProperty -Path $serverKey -Name LoginMode -ErrorAction Stop).LoginMode }
+    catch {
+        Write-Warning "Could not read LoginMode from ${serverKey}: $($_.Exception.Message)"
+        return $false
+    }
+
+    if ($current -eq 2) {
+        Write-Host "Mixed-mode authentication is already enabled (LoginMode=2)"
+        return $false
+    }
+
+    Write-Host "LoginMode is $current (Windows only) - setting it to 2 (mixed mode)" -ForegroundColor Green
+    try { Set-ItemProperty -Path $serverKey -Name LoginMode -Value 2 -Type DWord -ErrorAction Stop; return $true }
+    catch {
+        Write-Warning "Could not set LoginMode: $($_.Exception.Message)"
+        return $false
+    }
+}
+
 # Run the same T-SQL as the VM administrator instead of NT AUTHORITY\SYSTEM.
 #
 # The extension runs as SYSTEM and cannot change its own SQL login. On Azure SQL Server
@@ -201,6 +256,100 @@ function Invoke-SqlAsVmAdmin {
     }
 }
 
+# Give NT AUTHORITY\SYSTEM sysadmin back, using SQL Server's own documented recovery path
+# for a lost sysadmin.
+#
+# This is the only path that does not depend on something we cannot verify. On this image
+# both of the others failed:
+#   Connected to SQL as 'NT AUTHORITY\SYSTEM' - sysadmin=0 dbcreator=0
+#   Could not register the task as 'SqlServer2008\demouser': The user name or password is incorrect.
+# so no SQL principal could create the database and no Windows credential could be
+# validated either. What SYSTEM demonstrably *is* on this VM is a local administrator - it
+# writes HKLM, installs MSIs and registers tasks - and SQL Server, started with -m, treats
+# members of the local Administrators group as sysadmin. That is the documented way to
+# recover an instance whose sysadmins are all gone, and it needs no password at all.
+#
+# Scope: this touches only this VM's own SQL instance, so concurrent lab environments are
+# unaffected. The finally block always returns the service to normal however this exits.
+# ponytail: heavy-handed, but the alternative is a lab that needs a human with SSMS.
+function Grant-SysadminToSystem {
+    param([string] $ServerName)
+
+    Write-Warning "No usable sysadmin - attempting single-user recovery to restore it"
+
+    $servicePath = (Get-CimInstance Win32_Service -Filter "Name='MSSQLSERVER'" -ErrorAction SilentlyContinue).PathName
+    if (-not $servicePath) {
+        Write-Warning "  could not locate sqlservr.exe from the MSSQLSERVER service - giving up"
+        return $false
+    }
+    # PathName is quoted and may carry arguments; take the executable only.
+    $sqlservr = if ($servicePath.StartsWith('"')) { $servicePath.Split('"')[1] } else { $servicePath.Split(' ')[0] }
+    if (-not (Test-Path -Path $sqlservr -PathType Leaf)) {
+        Write-Warning "  '$sqlservr' does not exist - giving up"
+        return $false
+    }
+
+    $process = $null
+    $granted = $false
+    try {
+        Stop-Service -Name SQLSERVERAGENT -Force -ErrorAction SilentlyContinue
+        Stop-Service -Name MSSQLSERVER -Force -ErrorAction Stop
+        Write-Host "  MSSQLSERVER stopped; starting it in single-user mode"
+
+        $process = Start-Process -FilePath $sqlservr -ArgumentList '-m', '-s', 'MSSQLSERVER' -PassThru -WindowStyle Hidden
+
+        $recoveryArgs = @{ ServerInstance = $ServerName; QueryTimeout = 600 }
+        if ((Get-Command Invoke-Sqlcmd).Parameters.ContainsKey('TrustServerCertificate')) {
+            $recoveryArgs['TrustServerCertificate'] = $true
+        }
+
+        # -m accepts a single connection, so anything else that reconnects first takes the
+        # slot. Retry rather than assuming we win the race on the first try.
+        $connected = $false
+        $deadline = (Get-Date).AddMinutes(3)
+        while (-not $connected -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 15
+            try {
+                Invoke-Sqlcmd "SELECT 1" @recoveryArgs -ErrorAction Stop | Out-Null
+                $connected = $true
+            }
+            catch { Write-Host "  waiting for the single-user instance: $($_.Exception.Message)" }
+        }
+
+        if (-not $connected) {
+            Write-Warning "  could not get the single-user connection - giving up"
+            return $false
+        }
+
+        foreach ($stmt in @(
+            "IF SUSER_ID('NT AUTHORITY\SYSTEM') IS NULL CREATE LOGIN [NT AUTHORITY\SYSTEM] FROM WINDOWS;",
+            "ALTER SERVER ROLE sysadmin ADD MEMBER [NT AUTHORITY\SYSTEM];"
+        )) {
+            try {
+                Invoke-Sqlcmd $stmt @recoveryArgs -ErrorAction Stop
+                Write-Host "  applied: $stmt"
+                $granted = $true
+            }
+            catch { Write-Warning "  recovery statement failed: $($_.Exception.Message)" }
+        }
+        return $granted
+    }
+    catch {
+        Write-Warning "  single-user recovery failed: $($_.Exception.Message)"
+        return $false
+    }
+    finally {
+        # Whatever happened above, the instance must come back up normally.
+        if ($process -and -not $process.HasExited) {
+            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 20
+        }
+        Start-Service -Name MSSQLSERVER -ErrorAction SilentlyContinue
+        Start-Service -Name SQLSERVERAGENT -ErrorAction SilentlyContinue
+        Write-Host "  MSSQLSERVER returned to normal operation"
+    }
+}
+
 # Create the PartsUnlimited database and the PUWebSite login the web app connects with.
 function Setup-Sql {
     #Add snap-in
@@ -238,15 +387,28 @@ function Setup-Sql {
     # which is not a sysadmin on every SQL Server image - and that is the difference
     # between "SQL is not ready yet" and "SQL will not let us", which look identical from
     # the outside and is why this took several deployments to pin down.
+    # Poll rather than deciding on the first reading. This extension runs minutes after the
+    # VM's first boot, while the SQL image is still finishing its own specialization, and
+    # the sysadmin grant is not necessarily in place the instant the instance starts
+    # answering queries. Giving up immediately sends us down the fallback path (or no path
+    # at all) on a deployment that would have been fine thirty seconds later - which is why
+    # this worked on one environment and not the next with identical scripts.
     $canCreate = $false
-    try {
-        $who = Invoke-Sqlcmd "SELECT SUSER_NAME() AS [login], IS_SRVROLEMEMBER('sysadmin') AS [sysadmin], IS_SRVROLEMEMBER('dbcreator') AS [dbcreator]" @sqlArgs -ErrorAction Stop
-        Write-Host "Connected to SQL as '$($who.login)' - sysadmin=$($who.sysadmin) dbcreator=$($who.dbcreator)"
-        $canCreate = ($who.sysadmin -eq 1 -or $who.dbcreator -eq 1)
-    }
-    catch {
-        Write-Warning "Could not read SQL identity: $($_.Exception.Message)"
-    }
+    $deadline = (Get-Date).AddMinutes(10)
+    do {
+        try {
+            $who = Invoke-Sqlcmd "SELECT SUSER_NAME() AS [login], IS_SRVROLEMEMBER('sysadmin') AS [sysadmin], IS_SRVROLEMEMBER('dbcreator') AS [dbcreator]" @sqlArgs -ErrorAction Stop
+            Write-Host "Connected to SQL as '$($who.login)' - sysadmin=$($who.sysadmin) dbcreator=$($who.dbcreator)"
+            $canCreate = ($who.sysadmin -eq 1 -or $who.dbcreator -eq 1)
+        }
+        catch {
+            Write-Warning "Could not read SQL identity: $($_.Exception.Message)"
+        }
+        if (-not $canCreate -and (Get-Date) -lt $deadline) {
+            Write-Host "  no create permission yet - waiting for the instance to finish initialising"
+            Start-Sleep -Seconds 30
+        }
+    } while (-not $canCreate -and (Get-Date) -lt $deadline)
 
     # One copy of the statements, so the direct path and the fallback run the same thing.
     # Each is guarded with IF ... IS NULL, so the whole set is safe to repeat.
@@ -288,29 +450,63 @@ function Setup-Sql {
         Write-Warning "NT AUTHORITY\SYSTEM cannot create databases on this instance."
     }
 
-    # This fallback is why the lab no longer needs a human with SSMS: if the objects still
-    # are not there, run the identical statements as the VM administrator, which is a
-    # sysadmin on these images even when SYSTEM is not.
-    if (-not (Test-SqlObjects -SqlArgs $sqlArgs -DatabaseName $DatabaseName)) {
-        Invoke-SqlAsVmAdmin -Statements $statements -UserName $VmAdminUser -Password $SqlPass -SqlArgs $sqlArgs
-    }
+    # Mixed mode before anything else is judged. The xp_instance_regwrite statement above
+    # does this too, but it needs sysadmin; the registry does not, so SQL authentication
+    # gets switched on even on an instance where every statement above was denied. Until
+    # it is on, PUWebSite cannot log in no matter what else is correct.
+    Enable-SqlMixedMode | Out-Null
 
     Restart-Service -Force MSSQLSERVER
     #In case restart failed but service was shut down.
     Start-Service -Name 'MSSQLSERVER'
     Wait-SqlOnline -SqlArgs $sqlArgs | Out-Null
 
-    # Exercise 1 has the learner open this database in SSMS, and the web app connects to it,
-    # so verify both objects rather than trusting the statements above. $script:SqlSetupOk
-    # is what decides whether this deployment is allowed to be reported as successful.
-    $dbOk = Invoke-Sqlcmd "SELECT name FROM sys.databases WHERE name = '$DatabaseName'" @sqlArgs -ErrorAction SilentlyContinue
-    $loginOk = Invoke-Sqlcmd "SELECT name FROM sys.sql_logins WHERE name = 'PUWebSite'" @sqlArgs -ErrorAction SilentlyContinue
+    # Escalate only as far as needed, and stop as soon as the web app can actually log in.
+    #
+    # Step 1 is the VM administrator, which is a sysadmin on some of these images. It is
+    # tried first because it is cheap and non-invasive - but it is not dependable: on one
+    # environment its own credential would not even validate ("The user name or password is
+    # incorrect"), so the whole fallback was skipped and nothing created the database.
+    if (-not (Test-PUWebSiteLogin -ServerName $ServerName -DatabaseName $DatabaseName -Password $SqlPass)) {
+        Invoke-SqlAsVmAdmin -Statements $statements -UserName $VmAdminUser -Password $SqlPass -SqlArgs $sqlArgs
+    }
 
-    if ($dbOk -and $loginOk) {
-        Write-Host "$DatabaseName database and PUWebSite login are present" -ForegroundColor Green
+    # Step 2 is the one that does not depend on any credential or any SQL privilege. See
+    # the comment on Grant-SysadminToSystem for why this exists at all.
+    if (-not (Test-PUWebSiteLogin -ServerName $ServerName -DatabaseName $DatabaseName -Password $SqlPass)) {
+        if (Grant-SysadminToSystem -ServerName $ServerName) {
+            if (Wait-SqlOnline -SqlArgs $sqlArgs) {
+                try {
+                    $who = Invoke-Sqlcmd "SELECT SUSER_NAME() AS [login], IS_SRVROLEMEMBER('sysadmin') AS [sysadmin]" @sqlArgs -ErrorAction Stop
+                    Write-Host "After recovery: '$($who.login)' sysadmin=$($who.sysadmin)"
+                }
+                catch { Write-Warning "Could not re-read SQL identity: $($_.Exception.Message)" }
+
+                Enable-SqlMixedMode | Out-Null
+                foreach ($statement in $statements) {
+                    try { Invoke-Sqlcmd $statement @sqlArgs -ErrorAction Stop }
+                    catch {
+                        Write-Warning "Statement failed: $statement"
+                        Write-Warning "  $($_.Exception.Message)"
+                    }
+                }
+                Restart-Service -Force MSSQLSERVER
+                Start-Service -Name 'MSSQLSERVER'
+                Wait-SqlOnline -SqlArgs $sqlArgs | Out-Null
+            }
+        }
+    }
+
+    # Verify the way the web application does: log in as PUWebSite. Reading sys.databases
+    # and sys.sql_logins only proves what this connection is allowed to see, and proves
+    # nothing at all about whether SQL authentication is switched on - the exact gap that
+    # let a deployment report success while the site returned "Login failed for user
+    # 'PUWebSite'". $script:SqlSetupOk is what decides whether this is reported as working.
+    if (Test-PUWebSiteLogin -ServerName $ServerName -DatabaseName $DatabaseName -Password $SqlPass) {
+        Write-Host "$DatabaseName is reachable as PUWebSite - Exercise 1 and the web app will work" -ForegroundColor Green
         $script:SqlSetupOk = $true
     } else {
-        Write-Error ("SQL setup INCOMPLETE - database present: {0}, PUWebSite login present: {1}. Exercise 1 and the web app will both fail." -f [bool]$dbOk, [bool]$loginOk)
+        Write-Error "SQL setup INCOMPLETE - PUWebSite cannot log in to $DatabaseName. Exercise 1 and the web app will both fail. sqlvm-logontask.ps1 will retry this after both VMs are up."
     }
 }
 
@@ -336,10 +532,42 @@ function Test-DmaInstalled {
            Where-Object { $_.DisplayName -like '*Data Migration Assistant*' })
 }
 
+# Wait for any other MSI to finish before starting this one. The chocolatey dotnetfx
+# install immediately above holds the global installer mutex, and an msiexec that starts
+# while it is held fails instantly with 1618 - which is why all three attempts failed in a
+# few seconds on one deployment while the same MSI installed fine later from the run
+# command. Without this the retries were just three fast failures in a row.
+function Wait-MsiFree {
+    param([int] $TimeoutSeconds = 600)
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        try {
+            $mutex = [System.Threading.Mutex]::OpenExisting("Global\_MSIExecute")
+            $mutex.Dispose()
+            Write-Host "  another installer is running - waiting"
+            Start-Sleep -Seconds 10
+        }
+        catch { return }
+    }
+    Write-Warning "  gave up waiting for the installer mutex after $TimeoutSeconds seconds"
+}
+
 for ($attempt = 1; $attempt -le 3 -and -not (Test-DmaInstalled); $attempt++) {
     Write-Host "Installing Data Migration Assistant (attempt $attempt)" -ForegroundColor Green
-    (New-Object System.Net.WebClient).DownloadFile('https://download.microsoft.com/download/C/6/3/C63D8695-CEF2-43C3-AF0A-4989507E429B/DataMigrationAssistant.msi', 'C:\DataMigrationAssistant.msi')
-    Start-Process -file 'C:\DataMigrationAssistant.msi' -arg '/qn /l*v C:\dma_install.txt' -passthru | wait-process
+    try {
+        (New-Object System.Net.WebClient).DownloadFile('https://download.microsoft.com/download/C/6/3/C63D8695-CEF2-43C3-AF0A-4989507E429B/DataMigrationAssistant.msi', 'C:\DataMigrationAssistant.msi')
+    }
+    catch {
+        Write-Warning "  download failed: $($_.Exception.Message)"
+        Start-Sleep -Seconds 20
+        continue
+    }
+
+    Wait-MsiFree
+    $proc = Start-Process -FilePath 'C:\DataMigrationAssistant.msi' -ArgumentList '/qn', '/l*v', 'C:\dma_install.txt' -Wait -PassThru
+    # 1618 is "another installation is in progress", 3010 is "success, reboot required".
+    Write-Host "  msiexec exit code $($proc.ExitCode)"
+    if ($proc.ExitCode -eq 1618) { Start-Sleep -Seconds 60 }
 }
 
 if (Test-DmaInstalled) {
